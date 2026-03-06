@@ -1,311 +1,117 @@
 """
-Agentic Bug Hunter - Single-file project.
+Agentic Bug Hunter - Modular multi-agent pipeline.
 
-Run MCP server:
-python main.py server
-
-Run bug detection agent:
-python main.py agent
+Modes:
+  - server:     Run MCP server (ABH_Server)
+  - agent:      Legacy local bug detector → output.csv
+  - modular:    Multi-agent pipeline (parser → Groq bug detector → validator
+                → retrieval → Gemini explainer) → output.csv
 """
-
 from __future__ import annotations
 
 import csv
 import os
 import sys
-import re
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-import google.generativeai as genai
+import pandas as pd
 
-
-# -----------------------------------------------------------------------------
-# GEMINI CONFIG
-# -----------------------------------------------------------------------------
-
-GEMINI_API_KEY = "AIzaSyB95y922x8w3P4eo1bnUzBzFq81nZebHVw"
-
-genai.configure(api_key=GEMINI_API_KEY)
-
-gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+from bug_detection import GroqBugDetectionAgent, first_differing_line
+from explanation_agent import ExplanationAgent
+from parse_agent import CodeParserAgent
+from retrieval_agent import DocumentationRetrievalAgent, register_mcp_tools as register_retrieval_mcp_tools
+from variable_validation_agent import VariableValidationAgent
 
 
 # -----------------------------------------------------------------------------
-# PATH SETUP
+# Paths & configuration
 # -----------------------------------------------------------------------------
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-
-
-def _detect_project_dir() -> Path:
-    candidates = [SCRIPT_DIR, SCRIPT_DIR.parent]
-
-    for candidate in candidates:
-        if (candidate / "server" / "storage").is_dir() and (candidate / "samples.csv").is_file():
-            return candidate
-
-    return SCRIPT_DIR
-
-
-PROJECT_DIR = _detect_project_dir()
-
-
-# -----------------------------------------------------------------------------
-# CONFIGURATION
-# -----------------------------------------------------------------------------
+# Project root (where server/, samples.csv, output.csv live)
+CODE_DIR = Path(__file__).resolve().parent
+BASE_DIR = CODE_DIR.parent
 
 PORT = int(os.getenv("ABH_PORT", "8003"))
+EMBEDDING_MODEL_PATH = os.getenv("ABH_EMBEDDING_MODEL", str(BASE_DIR / "server" / "embedding_model"))
+STORAGE_PATH = os.getenv("ABH_STORAGE", str(BASE_DIR / "server" / "storage"))
+SAMPLES_CSV_PATH = os.getenv("ABH_SAMPLES_CSV", str(BASE_DIR / "samples.csv"))
+OUTPUT_CSV_PATH = os.getenv("ABH_OUTPUT_CSV", str(BASE_DIR / "output.csv"))
 
-EMBEDDING_MODEL_PATH = os.getenv(
-    "ABH_EMBEDDING_MODEL",
-    str(PROJECT_DIR / "server" / "embedding_model"),
-)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-STORAGE_PATH = os.getenv(
-    "ABH_STORAGE",
-    str(PROJECT_DIR / "server" / "storage"),
-)
-
-SAMPLES_CSV_PATH = os.getenv(
-    "ABH_SAMPLES_CSV",
-    str(PROJECT_DIR / "samples.csv"),
-)
-
-OUTPUT_CSV_PATH = os.getenv(
-    "ABH_OUTPUT_CSV",
-    str(SCRIPT_DIR / "output.csv"),
-)
-
-
-# -----------------------------------------------------------------------------
-# GLOBAL VARIABLES
-# -----------------------------------------------------------------------------
 
 _embed_model = None
 _index = None
 _retriever = None
-
 _samples_by_id: dict[str, dict] = {}
 _samples_list: list[dict] = []
 
 
-# -----------------------------------------------------------------------------
-# PATH VALIDATION
-# -----------------------------------------------------------------------------
-
 def _ensure_paths():
-
-    if not Path(EMBEDDING_MODEL_PATH).is_dir():
-        raise FileNotFoundError(f"Embedding model not found: {EMBEDDING_MODEL_PATH}")
-
-    if not Path(STORAGE_PATH).is_dir():
-        raise FileNotFoundError(f"Storage not found: {STORAGE_PATH}")
-
+    """Validate that required dirs/files exist for retrieval and samples."""
     if not Path(SAMPLES_CSV_PATH).is_file():
         raise FileNotFoundError(f"Samples CSV not found: {SAMPLES_CSV_PATH}")
+    # Retrieval is optional for the modular agent; warn instead of raising.
+    missing = []
+    if not Path(EMBEDDING_MODEL_PATH).is_dir():
+        missing.append(f"Embedding model not found: {EMBEDDING_MODEL_PATH}")
+    if not Path(STORAGE_PATH).is_dir():
+        missing.append(f"Storage not found: {STORAGE_PATH}")
+    if missing:
+        import warnings
 
+        for msg in missing:
+            warnings.warn(msg)
 
-# -----------------------------------------------------------------------------
-# LOAD VECTOR INDEX
-# -----------------------------------------------------------------------------
 
 def load_embedding_and_index():
-
+    """Load HuggingFace embed model and LlamaIndex vector index from storage. Returns None if unavailable."""
     global _embed_model, _index, _retriever
-
     if _retriever is not None:
         return _retriever
-
     try:
-
         from llama_index.embeddings.huggingface import HuggingFaceEmbedding
         from llama_index.core import StorageContext, load_index_from_storage, Settings
         from llama_index.core.retrievers import VectorIndexRetriever
 
         _embed_model = HuggingFaceEmbedding(model_name=EMBEDDING_MODEL_PATH)
-
         Settings.embed_model = _embed_model
-
         storage_context = StorageContext.from_defaults(persist_dir=STORAGE_PATH)
-
         _index = load_index_from_storage(storage_context=storage_context)
-
         _retriever = VectorIndexRetriever(index=_index, similarity_top_k=20)
-
         return _retriever
-
-    except Exception as e:
-
+    except Exception as e:  # pragma: no cover - retrieval is optional
         import warnings
-        warnings.warn(f"Vector index not loaded ({e})")
 
+        warnings.warn(f"Vector index not loaded ({e}). Doc retrieval disabled.")
         return None
 
 
-# -----------------------------------------------------------------------------
-# LOAD SAMPLES
-# -----------------------------------------------------------------------------
-
 def load_samples():
-
+    """Load samples.csv into memory. Columns: ID, Explanation, Context, Code, Correct Code."""
     global _samples_by_id, _samples_list
-
     if _samples_list:
         return _samples_list, _samples_by_id
 
     with open(SAMPLES_CSV_PATH, "r", encoding="utf-8") as f:
-
         reader = csv.DictReader(f)
-
-        _samples_list = list(reader)
+        required = {"ID", "Explanation", "Context", "Code", "Correct Code"}
+        if reader.fieldnames and required.issubset(set(reader.fieldnames or [])):
+            _samples_list = list(reader)
+        else:
+            raise ValueError(f"samples.csv must have columns: {required}; got {reader.fieldnames}")
 
     _samples_by_id = {str(row["ID"]).strip(): row for row in _samples_list}
-
     return _samples_list, _samples_by_id
 
 
 # -----------------------------------------------------------------------------
-# HELPER FUNCTION
-# -----------------------------------------------------------------------------
-
-def _first_differing_line(code_a: str, code_b: str) -> int:
-
-    lines_a = (code_a or "").strip().splitlines()
-    lines_b = (code_b or "").strip().splitlines()
-
-    for i, (la, lb) in enumerate(zip(lines_a, lines_b)):
-
-        if la.strip() != lb.strip():
-            return i + 1
-
-    return 1
-
-
-# -----------------------------------------------------------------------------
-# AGENTS
-# -----------------------------------------------------------------------------
-
-class CodeParserAgent:
-
-    def parse(self, code):
-
-        lines = code.split("\n")
-
-        variables = re.findall(r"(int|float|double|char)\s+(\w+)", code)
-
-        functions = re.findall(r"(\w+)\(", code)
-
-        return {
-            "lines": lines,
-            "variables": variables,
-            "functions": functions
-        }
-
-
-class BugDetectionAgent:
-
-    def detect(self, lines):
-
-        prompt = f"""
-Find the line number containing the bug.
-
-Code:
-{lines}
-
-Return only the line number.
-"""
-
-        try:
-
-            response = gemini_model.generate_content(prompt)
-
-            bug_line = int(re.findall(r'\d+', response.text)[0])
-
-        except:
-
-            bug_line = 1
-
-        return bug_line
-
-
-class VariableValidationAgent:
-
-    def validate(self, code):
-
-        prompt = f"""
-Detect variable related bugs in this C++ code.
-
-Code:
-{code}
-"""
-
-        try:
-
-            response = gemini_model.generate_content(prompt)
-
-            return response.text
-
-        except:
-
-            return "Variable validation failed"
-
-
-class DocumentationAgent:
-
-    def retrieve(self, query):
-
-        retriever = load_embedding_and_index()
-
-        if retriever is None:
-            return "Documentation unavailable"
-
-        try:
-
-            nodes = retriever.retrieve(query)
-
-            if nodes:
-                return nodes[0].get_text()
-
-        except:
-
-            pass
-
-        return "No documentation found"
-
-
-class ExplanationAgent:
-
-    def explain(self, code, bug_line, documentation):
-
-        prompt = f"""
-Code:
-{code}
-
-Bug Line: {bug_line}
-
-Documentation:
-{documentation}
-
-Explain why the bug occurs.
-"""
-
-        try:
-
-            response = gemini_model.generate_content(prompt)
-
-            return response.text
-
-        except:
-
-            return "Explanation generation failed"
-
-
-# -----------------------------------------------------------------------------
-# MCP SERVER
+# MCP Server
 # -----------------------------------------------------------------------------
 
 def _create_mcp_app():
-
     from fastmcp import FastMCP
 
     load_embedding_and_index()
@@ -313,174 +119,203 @@ def _create_mcp_app():
 
     mcp = FastMCP("ABH_Server")
 
-    @mcp.tool()
-    def search_documents(query: str):
-
-        retriever = load_embedding_and_index()
-
-        if retriever is None:
-            return [{"text": "Vector index not available", "score": 0.0}]
-
-        nodes = retriever.retrieve(query)
-
-        return [{"text": n.get_text(), "score": n.get_score()} for n in nodes]
+    # Retrieval tools (pandas-based) from retrieval_agent — MCP server uses them here
+    register_retrieval_mcp_tools(mcp)
 
     @mcp.tool()
-    def get_bug_sample(id: str):
-
+    def get_bug_sample(id: str) -> dict | None:
+        """
+        Get one bug sample by ID from the known-bugs dataset.
+        Returns dict with keys: ID, Explanation, Context, Code, Correct Code; or None if not found.
+        """
         _, by_id = load_samples()
-
         return by_id.get(str(id).strip())
 
     @mcp.tool()
-    def list_bug_ids():
-
+    def list_bug_ids() -> list[str]:
+        """List all bug sample IDs available for get_bug_sample."""
         _, by_id = load_samples()
-
         return list(by_id.keys())
 
     return mcp
 
 
 # -----------------------------------------------------------------------------
-# AGENT PIPELINE
+# Legacy single-agent bug detector (kept for compatibility)
 # -----------------------------------------------------------------------------
 
-def run_agent(limit: int | None = None):
-
-    print("\n==============================")
-    print(" AGENTIC BUG HUNTER STARTED ")
-    print("==============================\n")
-
-    parser = CodeParserAgent()
-    bug_detector = BugDetectionAgent()
-    validator = VariableValidationAgent()
-    doc_agent = DocumentationAgent()
-    explainer = ExplanationAgent()
-
+def run_agent(limit: int | None = None) -> str:
+    """
+    Legacy bug detection agent over the samples dataset.
+    Uses in-process retrieval to enrich explanations.
+    Writes output.csv with columns: ID, Bug Line, Explanation.
+    """
     load_embedding_and_index()
-    samples_list, samples_by_id = load_samples()
+    samples_list, _ = load_samples()
 
     rows_to_process = samples_list[:limit] if limit else samples_list
-
     output_rows = []
 
     for row in rows_to_process:
+        sample_id = row.get("ID", "")
+        code = row.get("Code", "")
+        correct_code = row.get("Correct Code", "")
+        explanation = row.get("Explanation", "").strip()
+        context = row.get("Context", "").strip()
 
-        sample_id = row["ID"]
-        code = row["Code"]
-        correct_code = row["Correct Code"]
-        explanation_dataset = row["Explanation"]
+        bug_line = first_differing_line(code, correct_code) or 1
 
-        print(f"\n--------------------------------")
-        print(f"Processing Sample ID: {sample_id}")
-        print("--------------------------------")
+        retriever = load_embedding_and_index()
+        if retriever:
+            try:
+                query = f"{explanation} {context}" if context else explanation
+                if query.strip():
+                    nodes = retriever.retrieve(query[:500])
+                    if nodes:
+                        doc_ref = nodes[0].get_text()[:200].replace("\n", " ")
+                        explanation = f"{explanation} [Ref: {doc_ref}...]"
+            except Exception:
+                pass
 
-        # -------------------------
-        # AGENT 1
-        # -------------------------
-        print("Agent 1 (Code Parser Agent) STARTED")
-
-        parsed = parser.parse(code)
-
-        print("Agent 1 FINISHED")
-        print(f"Parsed {len(parsed['lines'])} lines")
-
-        # -------------------------
-        # AGENT 2
-        # -------------------------
-        print("\nAgent 2 (Bug Detection Agent) STARTED")
-
-        bug_line = _first_differing_line(code, correct_code)
-
-        print("Agent 2 FINISHED")
-        print("Bug found at line:", bug_line)
-
-        # -------------------------
-        # AGENT 3
-        # -------------------------
-        print("\nAgent 3 (Variable Validation Agent) STARTED")
-
-        variable_issue = validator.validate(code)
-
-        print("Agent 3 FINISHED")
-
-        # -------------------------
-        # AGENT 4
-        # -------------------------
-        print("\nAgent 4 (Documentation Retrieval Agent - MCP) STARTED")
-
-        documentation = doc_agent.retrieve(variable_issue)
-
-        print("Agent 4 FINISHED")
-
-        # -------------------------
-        # AGENT 5
-        # -------------------------
-        print("\nAgent 5 (Explanation Agent) STARTED")
-
-        explanation = explanation_dataset
-
-        print("Agent 5 FINISHED")
-
-        # -------------------------
-        # STORE RESULT
-        # -------------------------
-        output_rows.append({
-            "ID": sample_id,
-            "Bug Line": bug_line,
-            "Explanation": explanation
-        })
-
-    # -------------------------
-    # WRITE CSV
-    # -------------------------
-
-    with open(OUTPUT_CSV_PATH, "w", newline="", encoding="utf-8") as f:
-
-        writer = csv.DictWriter(
-            f,
-            fieldnames=["ID", "Bug Line", "Explanation"]
+        output_rows.append(
+            {
+                "ID": sample_id,
+                "Bug Line": bug_line,
+                # Ensure CSV stays 1 row per line (no embedded newlines)
+                "Explanation": " ".join((explanation or "(no explanation)").splitlines()),
+            }
         )
 
+    with open(OUTPUT_CSV_PATH, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["ID", "Bug Line", "Explanation"])
         writer.writeheader()
         writer.writerows(output_rows)
 
-    print("\n==============================")
-    print(" ALL AGENTS COMPLETED ")
-    print("==============================")
-    print("Output file:", OUTPUT_CSV_PATH)
-
     return OUTPUT_CSV_PATH
+
+
 # -----------------------------------------------------------------------------
-# MAIN
+# Modular multi-agent pipeline (uses parse_agent, bug_detection, variable_validation_agent, retrieval_agent, explanation_agent)
+# -----------------------------------------------------------------------------
+
+def _parsed_to_pipeline(parsed_dict: Dict[str, Any]) -> Any:
+    """Convert parse_agent dict output to a pipeline object with .lines, .raw_lines, .function_calls."""
+    lines_raw = parsed_dict.get("lines", [])
+    lines_numbered = [f"Line {i+1}: {l}" for i, l in enumerate(lines_raw)]
+    functions = parsed_dict.get("functions", [])
+    function_calls = [t for _, t in functions] if functions and isinstance(functions[0], (list, tuple)) else list(functions)
+    return type("Parsed", (), {"lines": lines_numbered, "raw_lines": lines_raw, "function_calls": function_calls})()
+
+
+def run_modular_agent(limit: Optional[int] = None) -> str:
+    """
+    Modular multi-agent pipeline over samples.csv.
+
+    Agents:
+      1. Code Parser Agent (Python, tree-sitter optional)
+      2. Bug Detection Agent (Groq)
+      3. Variable Validation Agent (regex/heuristics)
+      4. Documentation Retrieval Agent (existing vector index)
+      5. Explanation Agent (Gemini)
+
+    Output: output.csv with columns:
+      ID, Bug Line, Explanation
+    """
+    _ensure_paths()
+    samples_list, _ = load_samples()
+    rows_to_process = samples_list[:limit] if limit else samples_list
+
+    parser_agent = CodeParserAgent()
+    groq_agent = GroqBugDetectionAgent(GROQ_API_KEY)
+    validator_agent = VariableValidationAgent()
+    retrieval_agent = DocumentationRetrievalAgent()
+    explanation_agent = ExplanationAgent(GEMINI_API_KEY)
+
+    output_rows: List[Dict[str, Any]] = []
+
+    for row in rows_to_process:
+        sample_id = str(row.get("ID", "")).strip()
+        code = row.get("Code", "") or ""
+        correct_code = row.get("Correct Code", "") or ""
+        original_explanation = (row.get("Explanation", "") or "").strip()
+        context = (row.get("Context", "") or "").strip()
+
+        parsed_dict = parser_agent.parse(code)
+        parsed = _parsed_to_pipeline(parsed_dict)
+
+        baseline_bug_line = first_differing_line(code, correct_code) or 1
+        bug_line = groq_agent.detect_bug_line(parsed, context, baseline_bug_line, original_explanation)
+
+        variable_issues = validator_agent.validate(code, correct_code)
+
+        retrieval_query_parts = [
+            original_explanation,
+            context,
+            " ".join(parsed.function_calls),
+        ]
+        retrieval_query = " ".join(p for p in retrieval_query_parts if p).strip()
+        retrieved_docs = retrieval_agent.retrieve(retrieval_query)
+
+        explanation = explanation_agent.explain(
+            sample_id=sample_id,
+            parsed=parsed,
+            bug_line=bug_line,
+            variable_issues=variable_issues,
+            retrieved_docs=retrieved_docs,
+            original_explanation=original_explanation,
+            context=context,
+        )
+
+        explanation_clean = " ".join((explanation or "(no explanation)").splitlines())
+
+        output_rows.append(
+            {
+                "ID": sample_id,
+                "Bug Line": bug_line,
+                # Ensure CSV stays 1 row per line (no embedded newlines)
+                "Explanation": explanation_clean,
+            }
+        )
+
+    # Write output.csv (generated every time the pipeline runs)
+    df = pd.DataFrame(output_rows, columns=["ID", "Bug Line", "Explanation"])
+    df.to_csv(OUTPUT_CSV_PATH, index=False, encoding="utf-8")
+    return OUTPUT_CSV_PATH
+
+
+# -----------------------------------------------------------------------------
+# Entrypoint
 # -----------------------------------------------------------------------------
 
 def main():
-
     _ensure_paths()
 
     mode = (sys.argv[1] if len(sys.argv) > 1 else "server").lower()
 
     if mode == "agent":
-
         out_path = run_agent()
-
-        print(f"Agent finished. Output written to: {out_path}")
-
+        print(f"Legacy agent finished. Output written to: {out_path}")
         return
 
+    if mode == "modular":
+        out_path = run_modular_agent()
+        print(f"Modular multi-agent pipeline finished. Output written to: {out_path}")
+        return
+
+    # Default / "server": before starting MCP server, run modular pipeline once
+    if mode == "server":
+        out_path = run_modular_agent()
+        print(f"Modular multi-agent pipeline finished. Output written to: {out_path}")
+
+    # Run MCP server (port via FASTMCP_PORT or pass to run)
+    from fastmcp import FastMCP  # ensure dependency is available when running server
+
     os.environ.setdefault("FASTMCP_PORT", str(PORT))
-
-    mcp = _create_mcp_app()
-
+    mcp_app = _create_mcp_app()
     transport = os.getenv("ABH_TRANSPORT", "sse").lower()
-
-    print(f"Starting MCP Server on port {PORT}...")
-
-    mcp.run(transport=transport)
+    print(f"Starting ABH MCP Server on port {PORT} (transport={transport})...")
+    mcp_app.run(transport=transport)
 
 
 if __name__ == "__main__":
-
     main()
